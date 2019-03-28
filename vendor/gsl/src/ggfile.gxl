@@ -1,0 +1,1780 @@
+<?xml?>
+<!--
+    GSL/file - File i/o module
+
+    Copyright (c) 1996-2010 iMatix Corporation
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 3 of the License, or (at
+    your option) any later version.
+
+    This program is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    For information on alternative licensing for OEMs, please contact
+    iMatix Corporation.
+-->
+
+<gxl script = "ggobjt.gsl" filename = "ggfile"
+     name   = "file" title = "GSL/fileio package" >
+
+<extra>
+typedef struct {
+    int
+        links;
+    char
+        *error_msg;
+} FILE_CONTEXT;
+
+typedef struct _DIRECTORY_ENTRY_ITEM {
+    int
+        links;
+    DIRST
+        *dirst;
+    struct _DIRECTORY_ENTRY_ITEM
+        *parent;
+    Bool
+        exists;
+    char
+        *path,
+        *name;
+    VALUE
+        *first_child,
+        *sibling;
+
+} DIRECTORY_ENTRY_ITEM;
+
+typedef struct {
+    int
+        links;
+    DIRST
+        *dirst;
+    struct _DIRECTORY_ENTRY_ITEM
+        *parent;
+    char
+        *path,
+        *name;
+    off_t
+        size;
+    time_t
+        timestamp;
+    FILE
+        *handle;
+    char
+        *error_msg;
+    VALUE
+        *sibling;
+} FILE_ENTRY_ITEM;
+
+/*  last_context is used so that the directory and file classes can share a  */
+/*  FILE_CONTEXT block to hold the last error message.  It's not elegant but */
+/*  We use assertions to be sure that it works as it should.                 */
+
+static FILE_CONTEXT
+    *last_context = NULL;
+
+static char
+    line_buffer [LINE_MAX + 1];
+
+#define FILE_NOT_OPEN_MESSAGE "File not open"
+
+
+/* directory.open has been modified to read all directory entries at start      */
+/* in order to detect and report errors that would otherwise appear during      */
+/* iteration, such as unreadable files or directories. Rather than storing,     */
+/* and passing around a dirst object that is read upon request, the entries     */
+/* are maintained as a linked list and the list traversed, with each iteration  */
+/* step. Since the traversal starts with the previous node, this ends up being  */
+/* an O(n) operation.                                                           */
+
+/* The DIRECTORY_ENTRY_ITEM structure has sibling and first_child members       */
+/* while FILE_ENTRY_ITEM has a sibling member. The first_child member is a bit  */
+/* redundant, if technically correct since we are dealing with a directory list */
+/* and not a tree. Oh well.  The first DIRECTORY_ENTRY_ITEM                     */
+/* actually represents the parent directory, which is the target of the open    */
+/* call. Its first_child member points to the first entry in the directory,     */
+/* and its sibling member, in turn, points to the next one.                     */
+/* Gyepi Sam - Feb 9, 2013                                                      */
+
+
+/* find first item of required type or first item if type is unspecified.  */    
+static int 
+get_directory_entry(VALUE *current,
+                    const char *name,
+                    Bool ignorecase,
+                    CLASS_DESCRIPTOR **class,
+                    void **item)
+{
+    Bool
+        getdir,
+        getfile;
+    int
+        rc = -1;
+
+
+    if (streq (name, ""))
+    {
+        getdir  = TRUE;
+        getfile = TRUE;
+    }
+    else
+    {
+        getfile = matches (name, "file");
+        getdir  = matches (name, "directory");
+    }
+
+    if (getfile || getdir)
+      {
+        while (current)
+         {
+         if (current-> c == &directory_entry_class)
+           {
+             if (!getdir)
+               {
+                 current = ((DIRECTORY_ENTRY_ITEM *) current-> i)-> sibling;
+                 continue;
+               }
+           }
+         else if (current-> c ==  &file_entry_class)
+           {
+             if (!getfile)
+               {
+                 current = ((FILE_ENTRY_ITEM *) current-> i)-> sibling;
+                 continue;
+               }
+           }
+         else
+           {
+            /* Added a new entry type ? */
+            abort();
+           }
+
+         *class = current-> c;
+         *item  = current-> i;
+         rc = 0;
+         break;
+       }
+    }
+
+    return rc;
+}
+
+static VALUE *
+link_directory_entry (DIRECTORY_ENTRY_ITEM *parent, VALUE *prev_entry, CLASS_DESCRIPTOR *class, void *item)
+{
+
+  VALUE 
+    *new_entry;
+
+  new_entry = memt_alloc (NULL, sizeof(VALUE));
+  init_value (new_entry);
+  assign_pointer (new_entry, class, item);
+
+  if (parent-> first_child == NULL)
+    parent-> first_child = new_entry;
+
+  if (prev_entry)
+    {
+      if (prev_entry->c == &directory_entry_class)
+        ((DIRECTORY_ENTRY_ITEM *) prev_entry-> i)->sibling = new_entry;
+      else if (prev_entry->c == &file_entry_class)
+        ((FILE_ENTRY_ITEM *) prev_entry-> i)->sibling = new_entry;
+    }
+
+  return new_entry;
+}
+
+static DIRECTORY_ENTRY_ITEM *
+build_directory_entries(char *pathname, char **error_msg)
+{
+
+  DIRST
+    *dirst;
+
+  DIRECTORY_ENTRY_ITEM
+    *parent, 
+    *directory;
+
+  FILE_ENTRY_ITEM
+    *file;
+
+  VALUE 
+    *last_value = NULL;
+
+  int
+     rc;
+
+
+  dirst = memt_alloc (NULL, sizeof (DIRST));
+  rc = open_dir (dirst, pathname);
+    
+  if (!rc)
+    {
+      /* errno disambiguates between
+         an abnormal error (real problem) and a normal error (no files in dir) */
+
+      if (errno)
+        {
+          *error_msg = xstrcpy(NULL, "'", clean_path(pathname),
+                               dirst->file_name, "' ",  strerror(errno), NULL);
+        }
+      else
+        {
+          *error_msg = xstrcpy(NULL, "'", clean_path(pathname), "' is empty",
+                               NULL);     
+        }
+
+      close_dir (dirst);
+      mem_free (dirst);
+      
+      return NULL;
+    }
+
+  /* The parent represents the original directory  */
+  parent = memt_alloc (NULL, sizeof (DIRECTORY_ENTRY_ITEM));
+  parent-> path        = xstrcpy (NULL, pathname, "/", NULL);
+  parent-> name        = memt_strdup (NULL, pathname);
+  parent-> dirst       = NULL;
+  parent-> links       = 0;
+  parent-> parent      = NULL;
+  parent-> first_child = NULL;
+  parent-> sibling     = NULL;
+  parent-> exists      = TRUE;
+
+  /* build a list of the directory children now so any
+     file access problems show up here and not during an iteration.    */
+
+  for(;;)
+    {
+    
+#if (defined (__UNIX__))
+      if (dirst-> file_mode & S_IFDIR)
+#else
+      if ((dirst-> file_attrs & ATTR_SUBDIR) != 0)
+#endif
+        {
+          directory = memt_alloc (NULL, sizeof (DIRECTORY_ENTRY_ITEM));
+          directory-> path        = xstrcpy (NULL, dirst-> dir_name, "/", NULL);
+          directory-> name        = memt_strdup (NULL, dirst-> file_name);
+          directory-> dirst       = NULL;
+          directory-> links       = 0;
+          directory-> parent      = parent;
+          directory-> first_child = NULL;
+          directory-> sibling     = NULL;
+          directory-> exists      = TRUE;
+                
+          last_value = link_directory_entry (parent, last_value,
+                                            & directory_entry_class, directory);
+        }
+#if (defined (__UNIX__))
+        else if (dirst-> file_mode & S_IFREG)
+#else
+        else
+#endif
+        {
+
+          file = memt_alloc (NULL, sizeof (FILE_ENTRY_ITEM));
+          file-> path      = xstrcpy (NULL, dirst-> dir_name, "/", NULL);
+          file-> name      = memt_strdup (NULL, dirst-> file_name);
+          file-> size      = dirst-> file_size;
+          file-> timestamp = dirst-> file_time;
+          file-> dirst     = NULL;
+          file-> links     = 0;
+          file-> parent    = parent;
+          file-> sibling   = NULL;
+          file-> handle    = NULL;
+          file-> error_msg = NULL;
+
+          last_value = link_directory_entry (parent, last_value,
+                                            & file_entry_class, file);
+        }
+      
+      rc = read_dir(dirst);
+
+      if (!rc)
+        {
+        /* disambiguate, again */
+        if (errno)
+          {
+              *error_msg = xstrcpy(NULL, parent->path,
+                                   dirst->file_name, ": ", strerror(errno), NULL);
+              directory_entry_destroy(parent);
+              parent = NULL;
+          }
+        else if (parent-> first_child == NULL)
+          {
+              *error_msg = xstrcpy(NULL, pathname, "/: has no files or directories", NULL);        
+              directory_entry_destroy(parent);
+              parent = NULL;
+         }
+
+        close_dir (dirst);
+        mem_free (dirst);
+        
+        return parent;
+      }
+    }
+
+  /* unreachable, but makes the compiler happy */
+  return parent;
+}
+
+
+static int
+store_module_error (THREAD       *gsl_thread,
+                    FILE_CONTEXT *context,
+                    RESULT_NODE  *error,
+                    const char   *error_msg)
+{
+    GGCODE_TCB
+        *gsl_tcb = gsl_thread-> tcb;
+    VALUE
+        value;
+    char
+        *error_text;
+
+    if (error_msg)
+      {
+        if (! context)
+            context = get_class_item (gsl_thread, FILE_NAME);
+        mem_free (context-> error_msg);
+        context-> error_msg = memt_strdup (NULL, error_msg);
+
+        if (error)
+          {
+            init_value (& value);
+            assign_string (& value, context-> error_msg);
+            if (! store_symbol_definition (& gsl_tcb-> scope_stack,
+                                           gsl_tcb-> gsl-> ignorecase,
+                                           error,
+                                           &value,
+                                           &error_text))
+              {
+                strncpy (object_error, error_text, LINE_MAX);
+                return -1;
+              }
+          }
+        }
+    return 0;
+}
+
+static int
+store_file_error (FILE_ENTRY_ITEM *file,
+                  THREAD          *gsl_thread,
+                  RESULT_NODE     *error,
+                  const char      *error_msg)
+{
+    if (error_msg)
+      {
+        mem_free (file-> error_msg);
+        file-> error_msg = memt_strdup (NULL, error_msg);
+      }
+    return store_module_error (gsl_thread, NULL, error, error_msg);
+}
+
+static void
+create_file_entry (const char *filename,
+                   FILE_CONTEXT *context,
+                   RESULT_NODE *result,
+                   RESULT_NODE *error,
+                   THREAD *gsl_thread)
+{
+    char
+        *curpath,
+        *fullname,
+        *lastchar;
+    FILE_ENTRY_ITEM
+        *file;
+
+    curpath = get_curdir ();
+    fullname = locate_path (curpath, filename);
+    mem_free (curpath);
+    lastchar = fullname + strlen (fullname) - 1;
+    if (*lastchar == '/')
+        *lastchar = 0;
+    curpath = strip_file_name (fullname);
+
+    file = memt_alloc (NULL, sizeof (FILE_ENTRY_ITEM));
+    file-> links     = 0;
+    file-> dirst     = NULL;
+    file-> parent    = NULL;
+    file-> sibling   = NULL;
+    file-> path      = memt_alloc (NULL, strlen (curpath) + 2);
+    xstrcpy (file-> path, curpath, "/", NULL);
+    file-> name      = memt_strdup (NULL, strip_file_path (fullname));
+    file-> size      = 0;
+    file-> timestamp = 0;
+    file-> handle    = NULL;
+    file-> error_msg = NULL;
+
+    if (file_exists (fullname))
+      {
+        file-> size      = get_file_size (fullname);
+        file-> timestamp = get_file_time (fullname);
+      }
+
+    assign_pointer (& result-> value, & file_entry_class, file);
+
+    mem_free (fullname);
+}
+
+static int
+open_the_file (FILE_ENTRY_ITEM *file, char mode,
+               RESULT_NODE *error,
+               THREAD *gsl_thread)
+{
+    char
+        *filename;
+
+    filename = memt_alloc (NULL,
+                           strlen (file-> path) + strlen (file-> name) + 2);
+    xstrcpy (filename,
+             file-> path, "/", file-> name, NULL);
+
+    errno = 0;
+    file-> handle = file_open (clean_path(filename), mode);
+    mem_free (filename);
+
+    return store_file_error (file, gsl_thread, error,
+                             errno ? strerror (errno) : NULL);
+}
+
+static int
+read_the_file (FILE_ENTRY_ITEM *file,
+               RESULT_NODE *result,
+               RESULT_NODE *error,
+               THREAD *gsl_thread)
+{
+    int
+        rc;
+
+    if (! file-> handle)
+        return store_file_error (file, gsl_thread, error,
+                                 FILE_NOT_OPEN_MESSAGE);
+
+    errno = 0;
+    rc = gsl_file_read (file-> handle, line_buffer);
+    if (rc)
+        assign_string (& result-> value, memt_strdup (NULL, line_buffer));
+
+    return store_file_error (file, gsl_thread, error,
+                             rc ? NULL : "End of file");
+}
+
+static int
+write_the_file (FILE_ENTRY_ITEM *file,
+                const char  *buffer,
+                RESULT_NODE *result,
+                RESULT_NODE *error,
+                THREAD *gsl_thread)
+{
+    char
+        *rc;
+
+    if (! file-> handle)
+        return store_file_error (file, gsl_thread, error,
+                                 FILE_NOT_OPEN_MESSAGE);
+
+    errno = 0;
+    rc = file_write (file-> handle, buffer);
+    if (rc)
+        assign_number (& result-> value, 0);
+    else
+        assign_number (& result-> value, -1);
+
+    return store_file_error (file, gsl_thread, error,
+                             errno ? strerror (errno) : NULL);
+}
+
+static int
+close_the_file (FILE_ENTRY_ITEM *file,
+                RESULT_NODE *result,
+                RESULT_NODE *error,
+                THREAD *gsl_thread)
+{
+    errno = 0;
+
+    if (! file-> handle)
+        return store_file_error (file, gsl_thread, error,
+                                 FILE_NOT_OPEN_MESSAGE);
+
+    if (file-> handle)
+      {
+        assign_number (& result-> value, file_close (file-> handle));
+        file-> handle = NULL;
+      }
+    return store_file_error (file, gsl_thread, error,
+                             errno ? strerror (errno) : NULL);
+}
+
+static int
+tell_the_file (FILE_ENTRY_ITEM *file,
+               RESULT_NODE *result,
+               RESULT_NODE *error,
+               THREAD *gsl_thread)
+{
+    errno = 0;
+
+    if (! file-> handle)
+        return store_file_error (file, gsl_thread, error,
+                                 FILE_NOT_OPEN_MESSAGE);
+
+    if (file-> handle)
+        assign_number (& result-> value, ftell (file-> handle));
+
+    return store_file_error (file, gsl_thread, error,
+                             errno ? strerror (errno) : NULL);
+}
+
+static int
+seek_the_file (FILE_ENTRY_ITEM *file,
+               qbyte offset,
+               RESULT_NODE *result,
+               RESULT_NODE *error,
+               THREAD *gsl_thread)
+{
+    errno = 0;
+
+    if (! file-> handle)
+        return store_file_error (file, gsl_thread, error,
+                                 FILE_NOT_OPEN_MESSAGE);
+
+    if (file-> handle)
+        assign_number (& result-> value,
+                       (offset == -1)
+                            ? fseek (file-> handle, 0,      SEEK_END)
+                            : fseek (file-> handle, offset, SEEK_SET));
+
+    return store_file_error (file, gsl_thread, error,
+                             errno ? strerror (errno) : NULL);
+}
+</extra>
+
+<!-- Directory Class --------------------------------------------------------->
+
+<class name = "directory" title = "Directory" register = "1" >
+
+    <initialise>
+  {
+    ASSERT (last_context == NULL);
+
+    last_context = memt_alloc (NULL, sizeof (FILE_CONTEXT));
+    last_context-> links     = 0;
+    last_context-> error_msg = NULL;
+
+    *item = last_context;
+  }
+    </initialise>
+
+    <operation type="link">
+    ((FILE_CONTEXT *) item)-> links++;
+    return 0;
+    </operation>
+
+    <operation type="destroy">
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    if (--context-> links == 0)
+      {
+        mem_free (context-> error_msg);
+        mem_free (context);
+      }
+    return 0;
+  }
+    </operation>
+
+    <operation type="get_attr">
+        <start>
+    static VALUE
+        value;
+    char
+        *ptr;
+
+    init_value (& value);
+        </start>
+        <attr name = "cwd">
+        ptr = get_curdir ();
+        strncpy (line_buffer, ptr, LINE_MAX);
+        line_buffer [LINE_MAX] = 0;
+        mem_free (ptr);
+        assign_string (& value, line_buffer);
+        </attr>
+        <finish>
+    return & value;
+        </finish>
+    </operation>
+
+<!-------------------------------------------------------------------------->
+
+    <function name = "open" >
+      <description>
+          Opens directory at `path` for iteration.
+          `path` is opened relative to current directory.
+          If `path` is not provided, uses the current directory.
+          
+          On success, returns a file entry for the first file in the directory.
+          On error, returns an undefined value and sets `error`, if provided.
+
+          Note: In addition to permission, type, or existence errors, open will
+          fail if the directory is empty since an empty directory has no entries.
+      </description>  
+        <parameter name = "path"     pass = "value"       compulsory = "0" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+    char
+        *curpath,
+        *fullpath,
+        *lastchar,
+        *error_msg,
+        *relative;
+
+    DIRECTORY_ENTRY_ITEM
+        *directory;
+
+    int
+        rc;
+
+    ASSERT (context);
+    
+    relative = path ? string_value (&path-> value) : ".";
+    
+    // normalize relative path
+#ifdef GATES_FILESYSTEM
+    strconvch (relative, PATHEND, '/');
+#endif
+
+    // make absolute path, with trailing slash
+    curpath = get_curdir ();
+    fullpath = locate_path (curpath, relative);
+    mem_free (curpath);
+
+    // strip trailing slash
+    lastchar = fullpath + strlen (fullpath) - 1;
+    if (*lastchar == '/')
+        *lastchar = 0;
+
+    error_msg = NULL;
+    directory = build_directory_entries (fullpath, &error_msg);
+    
+    if (directory)
+      {
+        assign_pointer (& result-> value, & directory_entry_class, directory);
+      }
+    
+    mem_free (fullpath);
+
+    if (error_msg)
+      {
+        rc = store_module_error (gsl_thread, context, error, error_msg);
+        mem_free(error_msg);
+      }
+    else
+      {
+        rc = store_module_error (gsl_thread, context, error, NULL);
+      }
+
+    return rc;
+  }
+        </body>
+    </function>
+
+<!-------------------------------------------------------------------------->
+
+    <function name = "setcwd" >
+      <description>
+        Changes current working directory to `path`.
+        Returns 0 on success.
+        Returns -1 on error and sets `error`, if provided.
+      </description>
+        <parameter name = "path"    pass = "value"       compulsory = "1" />
+        <parameter name = "error"   pass = "reference"   compulsory = "0" />
+    <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                   set_curdir (string_value (&path-> value)));
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+    </body>
+</function>
+
+<!-------------------------------------------------------------------------->
+
+    <function name = "create" >
+      <description>
+        Creates directory `path`.
+        On success returns 0.
+        On error, returns -1 and sets `error`, if provided.
+
+        Notes:
+        Can create multiple levels of directories, similar to 'mkdir -p' on unix.
+        Will return success on directories already exist. Note that this is true
+        even if the user does not access to said directory. Existence is all.
+        If created, directories have permission 0775.
+      </description>
+
+        <parameter name = "path" pass = "value" compulsory = "1" />
+        <body>
+  {
+    result-> value.n    = make_dir (string_value (&path-> value));
+    result-> value.type = TYPE_NUMBER;
+  }
+        </body>
+    </function>
+
+<!-------------------------------------------------------------------------->
+
+    <function name = "delete" >
+      <description>
+        Removes directory at `path`.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+        Note: will fail on non-empty directory.
+      </description>
+        <parameter name = "path"    pass = "value" compulsory = "1" />
+        <parameter name = "error"   pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                   remove_dir (string_value (& path-> value)));
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+<!-------------------------------------------------------------------------->
+
+    <function name = "resolve" >
+      <description>
+      Locates `path` relative to current directory.
+
+      If the path looks like an absolute directory, returns the cleaned up path.
+      Otherwise appends the path to the current directory and returns the cleaned up result.
+      
+      Cleans-up the returned path by appending a '/' if necessary, and resolving any '..' subpaths.
+
+      If `separator`, a single character, is provided the resulting path components are separated by `separator`
+      path components instead of the default separator (which depends on the operating system).
+      </description>
+
+        <parameter name = "path"      pass = "value" compulsory = "1" />
+        <parameter name = "separator" pass = "value" compulsory = "0" />
+        <body>
+  {
+    char
+        *curpath,
+        *clean;
+
+    if (separator
+    &&  separator-> value. type != TYPE_UNDEFINED)
+      {
+        if (strlen (string_value (& separator-> value)) != 1)
+          {
+            strcpy (object_error,
+                    "Argument 2 (separator) to directory.resolve must be a single character.");
+            return -1;
+          }
+      }
+    curpath = get_curdir ();
+    clean = locate_path (curpath, string_value (& path-> value));
+    mem_free (curpath);
+    if (separator
+    &&  separator-> value. type != TYPE_UNDEFINED)
+      {
+        strconvch (clean, '/',  separator-> value. s [0]);
+        strconvch (clean, '\\', separator-> value. s [0]);
+      }
+    assign_string (& result-> value, clean);
+  }
+        </body>
+    </function>
+
+</class>
+
+<!-- Directory Entry Class --------------------------------------------------->
+
+<class name = "directory entry" title = "Directory" register = "0" >
+
+    <operation type="link">
+    if (item)
+        ((DIRECTORY_ENTRY_ITEM *) item)-> links++;
+    return 0;
+    </operation>
+
+    <operation type="destroy">
+    DIRECTORY_ENTRY_ITEM
+        *directory = item;
+
+    if (directory
+    &&  --directory-> links &lt;= 0)
+      {
+        if (directory-> path)
+            mem_free (directory-> path);
+        if (directory-> name)
+            mem_free (directory-> name);
+        if (directory-> first_child)
+          {
+            destroy_value(directory-> first_child);
+            mem_free(directory-> first_child);
+          }
+        if (directory-> sibling)
+          {
+            destroy_value(directory-> sibling);
+            mem_free(directory-> sibling);
+          }
+        mem_free (directory);
+      }
+    return 0;
+    </operation>
+
+    <operation type="item_name">
+    return item ? "directory" : NULL;
+    </operation>
+
+    <operation type="get_attr">
+        <start>
+    DIRECTORY_ENTRY_ITEM
+        *directory = item;
+    static VALUE
+        value;
+
+    ASSERT (directory);
+
+    init_value (& value);
+        </start>
+        <attr name = "path">
+        assign_string (& value, directory-> path);
+        </attr>
+        <attr name = "name">
+        assign_string (& value, directory-> name);
+        </attr>
+        <finish>
+    return & value;
+        </finish>
+    </operation>
+
+    <operation type="put_attr">
+        <start>
+    DIRECTORY_ENTRY_ITEM
+        *directory = item;
+    char
+        *oldfullname,
+        *newfullname;
+    int
+        rc = 0;
+
+    ASSERT (directory);
+
+    if ((! name)
+    ||  (! value)
+    || value-> type == TYPE_POINTER)
+        return -1;
+
+    string_value (value);
+        </start>
+        <attr name = "name" >
+        if ((! directory-> exists)
+        ||  (! streq (directory-> name, value-> s)))
+          {
+            newfullname = memt_alloc (NULL,
+                                      strlen (directory-> path)
+                                    + strlen (value-> s) + 1);
+            xstrcpy (newfullname, directory-> path, value-> s, NULL);
+            if (directory-> exists)
+              {
+                oldfullname = memt_alloc (NULL,
+                                          strlen (directory-> path)
+                                        + strlen (directory-> name) + 1);
+                xstrcpy (oldfullname, directory-> path,
+                                      directory-> name, NULL);
+                rc = file_rename (oldfullname, newfullname);
+                mem_free (oldfullname);
+              }
+            else
+              {
+                if (file_exists (newfullname))
+                    rc = -1;
+                else
+                    rc = make_dir (newfullname);
+              }
+            mem_free (newfullname);
+
+            if (! rc)
+              {
+                directory-> exists = TRUE;
+                mem_free (directory-> name);
+                directory-> name = memt_strdup (NULL, value-> s);
+              }
+          }
+        </attr>
+        <finish>
+    else
+        rc = -1;
+
+    return rc;
+        </finish>
+    </operation>
+
+    <operation type="first_child">
+    DIRECTORY_ENTRY_ITEM
+        *directory = olditem;
+
+    ASSERT (directory);
+    return get_directory_entry(directory-> first_child, name, ignorecase, class, item);
+    </operation>
+
+    <operation type="next_sibling">
+    DIRECTORY_ENTRY_ITEM
+        *directory = olditem;
+
+    ASSERT (directory);
+    return get_directory_entry(directory-> sibling, name, ignorecase, class, item);
+    </operation>
+
+    <operation type="parent" >
+    DIRECTORY_ENTRY_ITEM
+        *directory = olditem;
+
+    ASSERT (directory);
+
+    *item = directory-> parent;
+    if (*item)
+        *class = & directory_entry_class;
+
+    return 0;
+    </operation>
+
+    <operation type="create" >
+    DIRECTORY_ENTRY_ITEM
+        *directory;
+
+    if (! streq (name, "directory"))
+        return -1;
+
+    if (sibling)                            /*  Can't specify sibling.  */
+        return -1;
+
+    directory = memt_alloc (NULL, sizeof (DIRECTORY_ENTRY_ITEM));
+    directory-> parent    = parent;
+    directory-> sibling   = NULL;
+    directory-> first_child = NULL;
+    directory-> path      = xstrcpy (NULL, directory-> parent-> path,
+                                           directory-> parent-> name, "/", NULL);
+    directory-> name      = NULL;
+    directory-> dirst     = NULL;
+    directory-> links     = 0;
+    directory-> exists    = FALSE;
+
+    *class = & directory_entry_class;
+    *item  =   directory;
+
+    return 0;
+    </operation>
+
+    <operation type="copy" >
+    int
+        rc = -1;
+    CLASS_DESCRIPTOR
+        *new_class;
+    void
+        *new_item = NULL;
+    VALUE
+        value;
+
+    init_value (& value);
+    value. type = TYPE_STRING;
+
+    if (to_class-> create)
+        rc = to_class-> create (name ? name : "directory",
+                                parent, sibling,
+                                &new_class, &new_item);
+
+    if ((! rc)
+    &&  new_item
+    &&  new_class-> put_attr)
+      {
+        value. s = mem_strdup (((DIRECTORY_ENTRY_ITEM *) item)-> name);
+        rc = new_class-> put_attr (new_item,
+                                   "name", & value,
+                                   FALSE);
+        if (rc)
+          {
+            if (new_class-> destroy)
+                new_class-> destroy (new_item);
+            new_item = NULL;
+          }
+      }
+    return new_item;
+    </operation>
+
+</class>
+
+<!-- File Class -------------------------------------------------------------->
+
+<class name = "file" title = "File" register="1" >
+
+    <initialise>
+    ASSERT (last_context);
+    *item = last_context;
+    last_context = NULL;
+    </initialise>
+
+    <operation type="link">
+    ((FILE_CONTEXT *) item)-> links++;
+    return 0;
+    </operation>
+
+    <operation type="destroy">
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    if (--context-> links == 0)
+      {
+        mem_free (context-> error_msg);
+        mem_free (context);
+      }
+    return 0;
+  }
+    </operation>
+
+    <operation type="get_attr">
+        <start>
+    FILE_CONTEXT
+        *context = item;
+    static VALUE
+        value;
+
+    init_value (& value);
+        </start>
+        <attr name="error" >
+        if (context-> error_msg)
+            assign_string (& value, context-> error_msg);
+        </attr>
+        <finish>
+    return & value;
+        </finish>
+    </operation>
+
+    <!-------------------------------------------------------------------------->
+
+    <function name = "open" cname="fileopen" >
+      <description>
+          Opens `filename` with `mode` for reading or writing, depending on `mode`.
+
+          If mode is 'r', the file is opened for reading. Default if mode is not provided.
+          If mode is 'w', the file is opened for writing. Empties file first.
+          If mode is 'a', the file is opened for appending to existing content.
+
+          On success, returns a file handle.
+          On error, returns undefined and sets `error`, if provided.
+      </description>
+
+        <parameter name = "filename" pass = "value"       compulsory = "1" />
+        <parameter name = "mode"     pass = "value"       compulsory = "0" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+    FILE_ENTRY_ITEM
+        *file;
+    int
+        rc;
+
+    ASSERT (context);
+
+    create_file_entry (string_value (& filename-> value),
+                       context,
+                       result,
+                       error,
+                       gsl_thread);
+
+    file = result-> value. i;
+    rc = open_the_file (file,
+                        (char) (mode ? *string_value (& mode-> value) : 'r'),
+                        error,
+                        gsl_thread);
+    if (rc
+    || (! file-> handle))
+      {
+        file_entry_destroy (file);
+        init_value (& result-> value);
+      }
+    return rc;
+  }
+        </body>
+    </function>
+
+    <function name = "read" cname="fileread" >
+      <description>
+        Reads a line from file `handle` .
+        On success, returns content read.
+        On error, returns undefined and sets `error`, if provided.
+      </description>
+
+        <parameter name = "handle"   pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    ASSERT (context);
+
+    if (handle-> value. type != TYPE_POINTER
+    ||  handle-> value. c    != & file_entry_class)
+      {
+        errno = EBADF;
+        return store_module_error (gsl_thread, context, error,
+                                   errno ? strerror (errno) : NULL);
+      }
+
+    return read_the_file (handle-> value. i,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "write" cname="filewrite" >
+      <description>
+        Writes `string` to file `handle`.
+
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+
+        <parameter name = "handle"   pass = "value"       compulsory = "1" />
+        <parameter name = "string"   pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    if (handle-> value. type != TYPE_POINTER
+    ||  handle-> value. c    != & file_entry_class)
+      {
+        errno = EBADF;
+        return store_file_error (handle-> value. i, gsl_thread, error,
+                                 errno ? strerror (errno) : NULL);
+      }
+
+    return write_the_file (handle-> value. i,
+                           string_value (&string-> value),
+                           result,
+                           error,
+                           gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "close" cname="fileclose" >
+      <description>
+        Closes file `handle`.
+
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+
+        <parameter name = "handle"   pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    if (handle-> value. type != TYPE_POINTER
+    ||  handle-> value. c    != & file_entry_class)
+      {
+        errno = EBADF;
+        return store_file_error (handle-> value. i, gsl_thread, error,
+                                 errno ? strerror (errno) : NULL);
+      }
+
+    return close_the_file (handle-> value. i,
+                           result,
+                           error,
+                           gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "tell" >
+      <description>
+        Returns the current file offset of `handle`.
+        The next `read` or `write` will start at that offset.
+        
+        On success, returns offset, a number.
+        On error, returns undefined and sets `error`, if provided.
+      </description>
+
+        <parameter name = "handle"   pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    if (handle-> value. type != TYPE_POINTER
+    ||  handle-> value. c    != & file_entry_class)
+      {
+        errno = EBADF;
+        return store_file_error (handle-> value. i, gsl_thread, error,
+                                 errno ? strerror (errno) : NULL);
+      }
+
+    return tell_the_file (handle-> value. i,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "seek" >
+      <description>
+        Moves current file offset to `offset`, a number, in file `handle`.
+
+        If `offset` is -1, seeks to end of file, otherwise seeks
+        to specified offset in file.
+
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+
+        Note: offset 0 is the beginning of the file.
+      </description>
+
+        <parameter name = "handle" pass = "value"       compulsory = "1" />
+        <parameter name = "offset" pass = "value"       compulsory = "0" />
+        <parameter name = "error"  pass = "reference"   compulsory = "0" />
+    <body>
+  {
+    if (handle-> value. type != TYPE_POINTER
+    ||  handle-> value. c    != & file_entry_class)
+      {
+        errno = EBADF;
+        return store_file_error (handle-> value. i, gsl_thread, error,
+                                 errno ? strerror (errno) : NULL);
+      }
+
+    return seek_the_file (handle-> value. i,
+                          offset ? (qbyte) number_value (&offset-> value) : 0,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "slurp" cname="fileslurp" >
+      <description>
+        Reads the entire content of `filename`.
+
+        On success, returns data read.
+        On error, returns undefined and sets `error`, if provided.
+      </description>
+
+        <parameter name = "filename" pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+    <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+    DESCR
+        *descr;
+    byte
+        *end_ptr;
+    size_t
+        length;
+    char
+        *string;
+
+    errno = 0;
+    descr = file_slurpl (string_value (&filename-> value));
+    if (descr)
+      {
+        /*  Look for NULL byte  */
+        end_ptr = memchr (descr-> data, 0, descr-> size);
+        if (! end_ptr)
+            length = descr-> size;
+        else
+            length = end_ptr - descr-> data;
+
+        string = memt_alloc (NULL, length + 1);
+        memcpy (string, descr-> data, length);
+        string [length] = 0;
+
+        mem_free (descr);
+
+        assign_string (& result-> value, string);
+      }
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "exists" cname="fileexists" >
+        <description>
+            Tests for file (or directory) existence.
+
+            Returns 1 if the file exists.
+            Returns 0 if the file does not exist and sets `error`, if provided.
+        </description>
+        <parameter name = "filename" pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    ASSERT (context);
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                   file_exists (string_value (&filename-> value)));
+
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "timestamp" >
+        <description>
+            Returns the modification date and time of `filename`,
+            a file or directory name, as a number in the format YYYYMMDDHHMMSS.
+
+            On success, returns a value.
+            On error, returns -1 and sets `error`, if provided.
+        </description>
+        <parameter name = "filename" pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+    time_t
+        timer;
+
+    errno = 0;
+    timer = get_file_time (string_value (&filename-> value));
+
+    ASSERT (context);
+
+    if (timer)
+        assign_number (& result-> value, (double) timer_to_date (timer) * 1000000
+                                   + (double) timer_to_time (timer) / 100);
+
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "rename" cname="filerename" >
+      <description>
+        Renames file or directory `oldname` to `newname`.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "oldname" pass = "value"       compulsory = "1" />
+        <parameter name = "newname" pass = "value"       compulsory = "1" />
+        <parameter name = "error"   pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    ASSERT (context);
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                   file_rename (string_value (&oldname-> value),
+                                string_value (&newname-> value)));
+
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "delete" cname="filedelete" >
+      <description>
+        Deletes file `filename`.
+
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "filename" pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                   file_delete (string_value (&filename-> value)));
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "locate" cname="filelocate" >
+      <description>
+          Searches for `filename` in a specified set of directories.
+          If provided, `path` is first considered an environment variable
+          and used to find the corresponding value. If there is no such value,
+          `path` is used as is. If `path` is not provided, the environment variable
+          `PATH` is used instead. If path is a literal, it is expected to be a list
+          of directories separated by the default separator for the operating system.
+
+          The current directory is implicitly prepended to the list and searched first.
+
+          On success, returns the fully qualified path to the file.
+          On error, returns undefined and sets `error`, if provided.
+      </description>
+        <parameter name = "filename" pass = "value"      compulsory = "1" />
+        <parameter name = "path"     pass = "value"      compulsory = "0" />
+        <parameter name = "error"    pass = "reference"  compulsory = "0" />
+        <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+    char
+        *found;
+
+    ASSERT (context);
+
+    errno = 0;
+
+    found = file_where ('r',
+            path? string_value (&path-> value): "PATH",
+            string_value (&filename-> value), NULL);
+
+    if (found)
+        assign_string (& result-> value, memt_strdup (NULL, found));
+
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "copy" cname="filecopy" >
+      <description>
+        Copies file `src` to `dest` using `mode`.
+
+        `mode` determines how the file is copied;
+        'b' for binary mode, 't' for text mode.
+        The distinction only matters on DOS (and derivatives?).
+        'b' is the default.
+
+        On success, returns 1.
+        On error, returns -1 and sets `error`, if provided.
+
+        Note: if `dst` exists, returns 1 and skips the copy operation.
+        This could be considered a feature.
+      </description>
+        <parameter name = "src"      pass = "value"      compulsory = "1" />
+        <parameter name = "dest"     pass = "value"      compulsory = "1" />
+        <parameter name = "mode"     pass = "value"      compulsory = "0" />
+        <parameter name = "error"    pass = "reference"  compulsory = "0" />
+    <body>
+  {
+    FILE_CONTEXT
+        *context = item;
+
+    ASSERT (context);
+
+    errno = 0;
+
+    assign_number (& result-> value,
+                  (double) file_copy (
+                      string_value (&dest-> value),
+                      string_value (&src -> value),
+                      (char) (mode ? *string_value (&mode-> value): 'b')));
+
+    return store_module_error (gsl_thread, context, error,
+                               errno ? strerror (errno) : NULL);
+  }
+        </body>
+    </function>
+
+    <function name = "basename" >
+      <description>
+        Removes dot and extension, if any, from `filename`.
+        If `filename` contains multiple extensions, removes the last one.
+        
+        Returns an appropriately shorn string or `filename`, unchanged.
+      </description>
+        <parameter name = "filename" pass = "value" compulsory = "1" />
+        <body>
+  {
+    char
+        *strptr = strip_extension (string_value (&filename-> value));
+
+    assign_string (& result-> value, memt_strdup (NULL, strptr));
+  }
+        </body>
+    </function>
+
+</class>
+
+<!-- File Entry Class -------------------------------------------------------->
+
+<class name = "file entry" title = "File" register="0" >
+
+    <operation type="link">
+    if (item)
+        ((FILE_ENTRY_ITEM *) item)-> links++;
+    return 0;
+    </operation>
+
+    <operation type="destroy">
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    if (file
+    &&  --file-> links &lt;= 0)
+      {
+        mem_free (file-> path);
+        mem_free (file-> name);
+        if (file-> sibling)
+          {
+            destroy_value (file-> sibling);
+            mem_free(file-> sibling);
+          }
+        if (file-> handle)
+            file_close (file-> handle);
+        mem_free (file-> error_msg);
+        mem_free (file);
+      }
+    return 0;
+    </operation>
+
+    <operation type="item_name">
+    return item ? "file" : NULL;
+    </operation>
+
+    <operation type="get_attr">
+        <start>
+    FILE_ENTRY_ITEM
+        *file = item;
+    static VALUE
+        value;
+
+    ASSERT (file);
+
+    if (! name)
+        return NULL;
+
+    init_value (& value);
+        </start>
+        <attr name="path" >
+        assign_string (& value, file-> path);
+        </attr>
+        <attr name="name" >
+        assign_string (& value, file-> name);
+        </attr>
+        <attr name="size" >
+        assign_string (& value, strprintf ("%lu", file-> size));
+        </attr>
+        <attr name="time" >
+        assign_string (& value,
+                       strprintf ("%lu", timer_to_time (file-> timestamp)));
+        </attr>
+        <attr name="date" >
+        assign_string (& value,
+                       strprintf ("%lu", timer_to_date (file-> timestamp)));
+        </attr>
+        <attr>
+        assign_string (& value, file-> name);
+        </attr>
+        <finish>
+    return & value;
+        </finish>
+    </operation>
+
+    <operation type="next_sibling">
+    FILE_ENTRY_ITEM
+        *file = olditem;
+
+    ASSERT (file);
+    return get_directory_entry(file-> sibling, name, ignorecase, class, item);
+    </operation>
+
+    <operation type="parent" >
+    FILE_ENTRY_ITEM
+        *file = olditem;
+
+    ASSERT (file);
+
+    *item = file-> parent;
+    if (*item)
+        *class = & directory_entry_class;
+
+    return 0;
+    </operation>
+
+<!---------------------------------------------------------------------------->
+
+    <function name = "open" >
+      <description>
+        Opens the file with `mode`; 'r', 'w', or 'a'.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "mode"     pass = "value"       compulsory = "0" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+    int
+        rc;
+
+    ASSERT (file);
+
+    rc = open_the_file (file,
+                        (char) (mode ? *string_value (& mode-> value) : 'r'),
+                        error,
+                        gsl_thread);
+    if (! rc)
+        assign_number (& result-> value, file-> handle ? 0 : -1);
+
+    return rc;
+  }
+        </body>
+    </function>
+
+    <function name = "read" >
+      <description>
+        Reads a line from file.
+        On success, returns line read.
+        On error, returns undefined and sets `error`, if provided.
+      </description>
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    ASSERT (file);
+
+    return read_the_file (file,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "write" >
+      <description>
+        Writes the string to file.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "string"   pass = "value"       compulsory = "1" />
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    ASSERT (file);
+
+    return write_the_file (file,
+                           string_value (&string-> value),
+                           result,
+                           error,
+                           gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "close" >
+      <description>
+        Closes the file.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    ASSERT (file);
+
+    return close_the_file (file,
+                           result,
+                           error,
+                           gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "tell" >
+        <parameter name = "error"    pass = "reference"   compulsory = "0" />
+        <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    ASSERT (file);
+
+    return tell_the_file (file,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+    <function name = "seek" >
+      <description>
+        Seeks to `offset`. See File.seek for details.
+        On success, returns 0.
+        On error, returns -1 and sets `error`, if provided.
+      </description>
+        <parameter name = "offset" pass = "value"       compulsory = "0" />
+        <parameter name = "error"  pass = "reference"   compulsory = "0" />
+    <body>
+  {
+    FILE_ENTRY_ITEM
+        *file = item;
+
+    ASSERT (file);
+
+    return seek_the_file (file,
+                          offset ? (qbyte) number_value (&offset-> value) : 0,
+                          result,
+                          error,
+                          gsl_thread);
+  }
+        </body>
+    </function>
+
+</class>
+
+</gxl>

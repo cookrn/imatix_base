@@ -1,0 +1,140 @@
+<?xml?>
+<!--
+    GSL/conv - Conversion functions
+
+    Copyright (c) 1996-2010 iMatix Corporation
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 3 of the License, or (at
+    your option) any later version.
+
+    This program is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    General Public License for more details.
+
+    For information on alternative licensing for OEMs, please contact
+    iMatix Corporation.
+-->
+
+<gxl script = "ggobjt.gsl" filename = "ggconv" title = "GSL/conv package" >
+
+<extra>
+</extra>
+
+<class name = "conv" title = "Conversion Functions" >
+
+<!-------------------------------------------------------------------------->
+
+<function name = "chr" >
+    <description>
+        Converts ascii code to character.
+        If the argument is a number between 1 and 255, inclusive,
+        returns the character represented by the ascii code.
+        If the argument is a number is outside the range,
+        returns the empty string.
+    </description>
+    <parameter name = "arg" pass = "value" compulsory = "1"/>
+<body>
+  {
+    number_value (&arg-> value);
+    
+    if (arg-> value. type == TYPE_NUMBER)
+      {
+        result-> value. type  = TYPE_STRING;
+        result-> value. s = mem_alloc (2);
+
+        ASSERT (result-> value. s);
+        
+        if (arg-> value. n > 0
+        && arg-> value. n &lt; 256)
+            result-> value. s [0] = (char) arg-> value. n;
+        else
+            result-> value. s [0] = '\0';
+
+        result-> value. s [1] = '\0';
+      }
+    else
+      {
+        result-> culprit = arg-> culprit;
+        arg-> culprit = NULL;
+      }
+    return 0;
+  }
+</body>
+</function>
+
+<!-------------------------------------------------------------------------->
+
+<function name = "number" >
+    <description>
+        Converts numeric looking input to number value.
+        If the argument looks like a number, returns the numeric value.
+    </description>
+    <parameter name = "arg" pass = "value"  compulsory = "1"/>
+<body>
+  {
+    number_value (&arg-> value);
+    
+    if (arg-> value. type == TYPE_NUMBER)
+        copy_value (&result-> value, &arg-> value);
+
+    return 0;
+  }
+</body>
+</function>
+
+<!-------------------------------------------------------------------------->
+
+<function name = "ord" >
+    <description>
+        Converts character to ascii code.
+        If the argument is a string, returns the ascii 
+        code of the first character, only.  
+    </description>
+
+    <parameter name = "arg" pass = "value" compulsory = "1"/>
+<body>
+  {
+    string_value (&arg-> value);
+    
+    if (arg-> value. type == TYPE_STRING)
+      {
+        result-> value. type = TYPE_NUMBER;
+        result-> value. n    = arg-> value. s [0];
+      }
+    else
+      {
+        result-> culprit = arg-> culprit;
+        arg-> culprit = NULL;
+      }
+    return 0;
+  }
+</body>
+</function>
+
+<!-------------------------------------------------------------------------->
+
+<function name = "string" >
+    <description>
+        Converts input to string value.
+        If the argument is defined, returns string value.
+    </description>
+    <parameter name = "arg" pass = "value" compulsory = "1"/>
+<body>
+  {
+    if (arg-> value. type != TYPE_UNDEFINED)
+      {
+        string_value (&arg-> value);
+        copy_value (&result-> value, &arg-> value);
+      }
+
+    return 0;
+  }
+</body>
+</function>
+
+</class>
+
+</gxl>

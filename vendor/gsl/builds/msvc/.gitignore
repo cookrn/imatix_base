@@ -1,0 +1,9 @@
+*.opensdf
+*.suo
+*.sdf
+*.user
+*.aps
+*.log
+*/packages/
+!build
+build/pcre.*/
