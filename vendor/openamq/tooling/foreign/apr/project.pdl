@@ -93,7 +93,7 @@
   <build>
     <execute target = "unix">
     <!-- figure out options to configure -->
-    conf_opts="--without-libtool --disable-shared --without-sendfile --enable-threads --enable-nonportable-atomics"
+    conf_opts="--prefix=$IBASE --without-sendfile --enable-threads --enable-nonportable-atomics"
     if [ -z "$BOOM_TRACE" ]; then
 	conf_opts="$conf_opts --quiet"
     fi
@@ -122,31 +122,39 @@
     <!-- apr -->
     cd apr
     if [ ! -f Makefile ]; then
+        [ "$BOOM_TRACE" ] && echo "(apr) ./buildconf"
+        ./buildconf || croak "(apr) ./buildconf failed"
+
         [ "$BOOM_TRACE" ] && echo "(apr) ./configure $conf_opts"
         ./configure $conf_opts  || croak "(apr) ./configure $conf_opts failed"
     fi
     <!-- the non-use and then use of RANLIB is needed to get a non-libtool build to work -->
     [ "$BOOM_TRACE" ] && echo "(apr) $MAKE RANLIB=/bin/true"
     $MAKE RANLIB=/bin/true    || croak "(apr) $MAKE RANLIB=/bin/true failed"
-    $RANLIB libapr*.la
+    cp .libs/libapr-1.a libapr-1.a
+    $RANLIB libapr*.a
     cd ..
     <!-- apr-util -->
     conf_opts="$conf_opts --with-apr=../apr --without-gdbm --without-ndbm --without-berkeley-db --without-pgsql --without-mysql --without-sqlite2 --without-sqlite3 --without-oracle --without-freetds --without-odbc"
     conf_opts="$conf_opts $APR_BOOM_CONF_OPTS"
     cd apr-util
     if [ ! -f Makefile ]; then
+        [ "$BOOM_TRACE" ] && echo "(apr-util) ./buildconf"
+        ./buildconf || croak "(apr-util) ./buildconf failed"
+
         [ "$BOOM_TRACE" ] && echo "(apr-util) ./configure $conf_opts"
         ./configure $conf_opts  || croak "(apr-util) ./configure $conf_opts failed"
     fi
     [ "$BOOM_TRACE" ] && echo "(apr-util) $MAKE RANLIB=/bin/true"
     $MAKE RANLIB=/bin/true    || croak "(apr-util) $MAKE RANLIB=/bin/true failed"
-    $RANLIB libaprutil*.la
+    cp .libs/libaprutil-1.a libaprutil-1.a
+    $RANLIB libaprutil*.a
     cd ..
     <!-- copy deliverables -->
     (
-        cp apr/libapr*.la          libapr.a          || exit 1
+        cp apr/libapr*.a           libapr.a          || exit 1
         cp apr/include/apr*.h      .                 || exit 1
-        cp apr-util/libaprutil*.la libaprutil.a      || exit 1
+        cp apr-util/libaprutil*.a  libaprutil.a      || exit 1
         cp apr-util/include/apr*.h .                 || exit 1
         cp apr-util/include/apu*.h .                 || exit 1
     ) || croak "Missing deliverables for apr/apr-util"

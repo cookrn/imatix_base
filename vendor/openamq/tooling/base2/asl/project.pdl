@@ -168,7 +168,7 @@
   <file name = "asl_pal_stdc.gsl"      class = "public resource" />
   <file name = "asl_pal_xnf.gsl"       class = "public resource" />
   <file name = "asl_pal_txt.gsl"       class = "public resource" />
-  <file name = "palguide.txt"          class = "gurudoc text"/>
+  <!-- <file name = "palguide.txt"          class = "gurudoc text"/> -->
   <file name = "pal"                   class = "command script" target = "unix" />
   <file name = "pal.bat"               class = "command script" target = "win32"/>
 

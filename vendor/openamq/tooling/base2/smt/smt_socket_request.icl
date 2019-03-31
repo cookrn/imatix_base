@@ -1308,7 +1308,8 @@ static void
                             //  Should not occur, but handle anyway just in case
                             if (desc->rtnevents & APR_POLLERR) {
                                 //  If APR_POLLERR is set, get error code.
-                                status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error);
+                                /* status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error); */
+                                status = apr_get_netos_error();
                                 //  Some implementations return error from getsockopt instead
                                 if (status != APR_SUCCESS && !error)
                                     error = status;
@@ -1327,7 +1328,8 @@ static void
                         case SOCK_CONNECT:
                             //  Always check error code for connect, since some implementations
                             //  return APR_POLLIN on error.
-                            status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error);
+                            /* status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error); */
+                            status = apr_get_netos_error();
                             //  Some implementations return error from getsockopt instead
                             if (status != APR_SUCCESS && !error)
                                 error = status;
@@ -1378,7 +1380,8 @@ static void
                             }
                             else {
                                 //  If APR_POLLERR is set, get error code.
-                                status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error);
+                                /* status = apr_socket_opt_get (socket->pollfd.desc.s, APR_SO_ERROR, &error); */
+                                status = apr_get_netos_error();
                                 //  Some implementations return error from getsockopt instead
                                 if (status != APR_SUCCESS && !error)
                                     error = status;

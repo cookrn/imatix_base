@@ -30,4 +30,6 @@ iMatix repositories.
 All code copyright by iMatix Corporation is marked as such in the headers of files. I
 do not suppose or presume any ownership of their code or IP. Please ask with any
 questions or concerns! Unmarked files only contributed by myself or others as a part
-of this project should be licensed MIT.
+of this project should be licensed MIT unless meant to be compiled with code licensed
+virally (no connotation intended), such as GPL. Updates made to existing source maintain
+their original licensing.
